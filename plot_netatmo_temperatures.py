@@ -145,7 +145,7 @@ def plot_svg(series: List[Tuple[datetime.datetime, Optional[float], Optional[flo
         return
     ys_t = [v for _, v in tpts] if tpts else [0.0]
     ys_h = [v for _, v in hpts] if hpts else [0.0]
-    W, H, pl, pr, pt, pb = 920, 360, 70, 60, 40, 60
+    W, H, pl, pr, pt, pb = 1600, 600, 90, 90, 60, 90
     xmin, xmax = min(xs), max(xs)
     ymin_t = min(ys_t) - 0.5 if tpts else 0.0
     ymax_t = max(ys_t) + 0.5 if tpts else 1.0
@@ -186,46 +186,47 @@ def plot_svg(series: List[Tuple[datetime.datetime, Optional[float], Optional[flo
 
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" font-family="sans-serif">']
     svg.append('<rect width="100%" height="100%" fill="white"/>')
-    svg.append(f'<text x="{W/2}" y="20" text-anchor="middle" font-size="16" font-weight="bold">{esc(title)}</text>')
+    svg.append(f'<text x="{W/2}" y="30" text-anchor="middle" font-size="24" font-weight="bold">{esc(title)}</text>')
     # left axis grid (temperature)
     for gy in gridy:
         y = sy_t(gy)
         svg.append(f'<line x1="{pl}" y1="{y:.2f}" x2="{W-pr}" y2="{y:.2f}" stroke="#ddd"/>')
-        svg.append(f'<text x="{pl-8}" y="{y+4:.2f}" text-anchor="end" font-size="11" fill="#d62728">{gy:.1f}°C</text>')
+        svg.append(f'<text x="{pl-10}" y="{y+5:.2f}" text-anchor="end" font-size="14" fill="#d62728">{gy:.1f}°C</text>')
     # right axis (humidity)
     if hpts:
         gridh = [ymin_h + i * (ymax_h - ymin_h) / 5 for i in range(6)]
         for gh in gridh:
             y = sy_h(gh)
-            svg.append(f'<text x="{W-pr+8}" y="{y+4:.2f}" text-anchor="start" font-size="11" fill="#1f77b4">{gh:.0f}%</text>')
+            svg.append(f'<text x="{W-pr+10}" y="{y+5:.2f}" text-anchor="start" font-size="14" fill="#1f77b4">{gh:.0f}%</text>')
     # x ticks
     for tx in ticks:
         x = sx(tx)
-        svg.append(f'<line x1="{x:.2f}" y1="{H-pb}" x2="{x:.2f}" y2="{H-pb+5}" stroke="#333"/>')
+        svg.append(f'<line x1="{x:.2f}" y1="{H-pb}" x2="{x:.2f}" y2="{H-pb+6}" stroke="#333"/>')
         fmt = "%m-%d %H:%M" if total_sec <= 3 * 86400 else "%Y-%m-%d"
-        svg.append(f'<text x="{x:.2f}" y="{H-pb+18}" text-anchor="middle" font-size="10">{tx.strftime(fmt)}</text>')
+        svg.append(f'<text x="{x:.2f}" y="{H-pb+24}" text-anchor="middle" font-size="13">{tx.strftime(fmt)}</text>')
     # temperature (solid)
     if tpts:
         pts_t = " ".join(f"{sx(x):.2f},{sy_t(y):.2f}" for x, y in tpts)
-        svg.append(f'<polyline fill="none" stroke="#d62728" stroke-width="2" points="{pts_t}"/>')
-        r = 2.5 if len(tpts) < 200 else 1.5
+        svg.append(f'<polyline fill="none" stroke="#d62728" stroke-width="2.5" points="{pts_t}"/>')
+        r = 3.0 if len(tpts) < 200 else 2.0
         for x, y in tpts:
             svg.append(f'<circle cx="{sx(x):.2f}" cy="{sy_t(y):.2f}" r="{r}" fill="#d62728"/>')
     # humidity (dotted)
     if hpts:
         pts_h = " ".join(f"{sx(x):.2f},{sy_h(y):.2f}" for x, y in hpts)
-        svg.append(f'<polyline fill="none" stroke="#1f77b4" stroke-width="2" stroke-dasharray="4 4" points="{pts_h}"/>')
-        r = 2.0 if len(hpts) < 200 else 1.2
+        svg.append(f'<polyline fill="none" stroke="#1f77b4" stroke-width="2.5" stroke-dasharray="6 5" points="{pts_h}"/>')
+        r = 2.5 if len(hpts) < 200 else 1.5
         for x, y in hpts:
             svg.append(f'<circle cx="{sx(x):.2f}" cy="{sy_h(y):.2f}" r="{r}" fill="#1f77b4"/>')
     # legend
-    lx, ly = pl + 10, pt + 10
-    svg.append(f'<rect x="{lx-6}" y="{ly-10}" width="170" height="{34 if hpts else 18}" fill="white" stroke="#ccc"/>')
-    svg.append(f'<line x1="{lx}" y1="{ly}" x2="{lx+20}" y2="{ly}" stroke="#d62728" stroke-width="2"/>')
-    svg.append(f'<text x="{lx+26}" y="{ly+4}" font-size="11">Temperature (°C)</text>')
+    lx, ly = pl + 20, pt + 20
+    box_h = 46 if hpts else 24
+    svg.append(f'<rect x="{lx-8}" y="{ly-14}" width="240" height="{box_h}" fill="white" stroke="#ccc"/>')
+    svg.append(f'<line x1="{lx}" y1="{ly}" x2="{lx+28}" y2="{ly}" stroke="#d62728" stroke-width="2.5"/>')
+    svg.append(f'<text x="{lx+36}" y="{ly+5}" font-size="14">Temperature (°C)</text>')
     if hpts:
-        svg.append(f'<line x1="{lx}" y1="{ly+16}" x2="{lx+20}" y2="{ly+16}" stroke="#1f77b4" stroke-width="2" stroke-dasharray="4 4"/>')
-        svg.append(f'<text x="{lx+26}" y="{ly+20}" font-size="11">Humidity (%)</text>')
+        svg.append(f'<line x1="{lx}" y1="{ly+22}" x2="{lx+28}" y2="{ly+22}" stroke="#1f77b4" stroke-width="2.5" stroke-dasharray="6 5"/>')
+        svg.append(f'<text x="{lx+36}" y="{ly+27}" font-size="14">Humidity (%)</text>')
 
     svg.append(f'<line x1="{pl}" y1="{H-pb}" x2="{W-pr}" y2="{H-pb}" stroke="#333"/>')
     svg.append(f'<line x1="{pl}" y1="{pt}" x2="{pl}" y2="{H-pb}" stroke="#333"/>')
@@ -242,28 +243,27 @@ def plot_png(series: List[Tuple[datetime.datetime, Optional[float], Optional[flo
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
 
-    xs = [p[0] for p in series]
     tpts = [(p[0], p[1]) for p in series if p[1] is not None]
     hpts = [(p[0], p[2]) for p in series if show_humidity and p[2] is not None]
-    fig, ax = plt.subplots(figsize=(10, 4))
+    fig, ax = plt.subplots(figsize=(16, 6))
     if tpts:
-        ax.plot([x for x, _ in tpts], [y for _, y in tpts], marker="o", markersize=3, linewidth=1.2, color="#d62728", label="Temperature (°C)")
-    ax.set_ylabel("Temperature (°C)", color="#d62728")
-    ax.tick_params(axis="y", labelcolor="#d62728")
-    ax.set_xlabel("Time (UTC)")
+        ax.plot([x for x, _ in tpts], [y for _, y in tpts], marker="o", markersize=4, linewidth=1.8, color="#d62728", label="Temperature (°C)")
+    ax.set_ylabel("Temperature (°C)", color="#d62728", fontsize=12)
+    ax.tick_params(axis="y", labelcolor="#d62728", labelsize=11)
+    ax.tick_params(axis="x", labelsize=11)
+    ax.set_xlabel("Time (UTC)", fontsize=12)
     ax.grid(True, alpha=0.3)
     if hpts:
         ax2 = ax.twinx()
-        ax2.plot([x for x, _ in hpts], [y for _, y in hpts], linestyle=":", marker="o", markersize=2.5, linewidth=1.2, color="#1f77b4", label="Humidity (%)")
-        ax2.set_ylabel("Humidity (%)", color="#1f77b4")
-        ax2.tick_params(axis="y", labelcolor="#1f77b4")
-        # combined legend
+        ax2.plot([x for x, _ in hpts], [y for _, y in hpts], linestyle=":", marker="o", markersize=3.5, linewidth=1.8, color="#1f77b4", label="Humidity (%)")
+        ax2.set_ylabel("Humidity (%)", color="#1f77b4", fontsize=12)
+        ax2.tick_params(axis="y", labelcolor="#1f77b4", labelsize=11)
         lines1, labels1 = ax.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax2.legend(lines1 + lines2, labels1 + labels2, loc="best")
+        ax2.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=11)
     elif tpts:
-        ax.legend(loc="best")
-    ax.set_title(title)
+        ax.legend(loc="best", fontsize=11)
+    ax.set_title(title, fontsize=16)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -287,7 +287,7 @@ def plot_combined_svg(all_series: List[Tuple[str, List[Tuple[datetime.datetime, 
     all_y_h = [p[1] for _, _, h in prepared for p in h]
     if not all_y_t:
         all_y_t = [0.0]
-    W, H, pl, pr, pt, pb = 1040, 460, 70, 250, 45, 60
+    W, H, pl, pr, pt, pb = 1800, 750, 90, 360, 70, 90
     xmin, xmax = min(all_x), max(all_x)
     ymin_t, ymax_t = min(all_y_t) - 0.5, max(all_y_t) + 0.5
     if all_y_h:
@@ -316,23 +316,23 @@ def plot_combined_svg(all_series: List[Tuple[str, List[Tuple[datetime.datetime, 
 
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" font-family="sans-serif">']
     svg.append('<rect width="100%" height="100%" fill="white"/>')
-    svg.append(f'<text x="{(W-pr)/2+pl/2}" y="22" text-anchor="middle" font-size="16" font-weight="bold">All rooms – Temperature &amp; Humidity (UTC)</text>')
+    svg.append(f'<text x="{(W-pr)/2+pl/2}" y="32" text-anchor="middle" font-size="26" font-weight="bold">All rooms – Temperature &amp; Humidity (UTC)</text>')
     gridy = [ymin_t + i * (ymax_t - ymin_t) / 5 for i in range(6)]
     for gy in gridy:
         y = sy_t(gy)
         svg.append(f'<line x1="{pl}" y1="{y:.2f}" x2="{W-pr}" y2="{y:.2f}" stroke="#eee"/>')
-        svg.append(f'<text x="{pl-8}" y="{y+4:.2f}" text-anchor="end" font-size="11" fill="#333">{gy:.1f}°C</text>')
+        svg.append(f'<text x="{pl-10}" y="{y+5:.2f}" text-anchor="end" font-size="14" fill="#333">{gy:.1f}°C</text>')
     if show_humidity and all_y_h:
         gridh = [ymin_h + i * (ymax_h - ymin_h) / 5 for i in range(6)]
         for gh in gridh:
             y = sy_h(gh)
-            svg.append(f'<text x="{W-pr+8}" y="{y+4:.2f}" text-anchor="start" font-size="11" fill="#333">{gh:.0f}%</text>')
+            svg.append(f'<text x="{W-pr+10}" y="{y+5:.2f}" text-anchor="start" font-size="14" fill="#333">{gh:.0f}%</text>')
     total_sec = max(1.0, (xmax - xmin).total_seconds())
     step_sec = max(3600, int(total_sec / 6 / 3600) * 3600)
     t = xmin
     while t <= xmax:
         x = sx(t)
-        svg.append(f'<text x="{x:.2f}" y="{H-pb+18}" text-anchor="middle" font-size="10">{t.strftime("%m-%d %H:%M")}</text>')
+        svg.append(f'<text x="{x:.2f}" y="{H-pb+24}" text-anchor="middle" font-size="13">{t.strftime("%m-%d %H:%M")}</text>')
         t += datetime.timedelta(seconds=step_sec)
 
     # plot series (humidity dotted, same color as room; temp solid)
@@ -340,28 +340,26 @@ def plot_combined_svg(all_series: List[Tuple[str, List[Tuple[datetime.datetime, 
         c = colors[i % len(colors)]
         if ts:
             pts = " ".join(f"{sx(x):.2f},{sy_t(y):.2f}" for x, y in ts)
-            svg.append(f'<polyline fill="none" stroke="{c}" stroke-width="1.8" points="{pts}"/>')
+            svg.append(f'<polyline fill="none" stroke="{c}" stroke-width="2.5" points="{pts}"/>')
         if hs:
             pts = " ".join(f"{sx(x):.2f},{sy_h(y):.2f}" for x, y in hs)
-            svg.append(f'<polyline fill="none" stroke="{c}" stroke-width="1.8" stroke-dasharray="4 4" points="{pts}"/>')
+            svg.append(f'<polyline fill="none" stroke="{c}" stroke-width="2.5" stroke-dasharray="6 5" points="{pts}"/>')
 
     # legend: per room temp (solid) + humidity (dotted) in same color
-    legend_x = W - pr + 40
-    legend_y = pt + 10
-    # headers
-    svg.append(f'<text x="{legend_x}" y="{legend_y}" font-size="11" font-weight="bold">Legend</text>')
-    ly = legend_y + 16
+    legend_x = W - pr + 50
+    svg.append(f'<text x="{legend_x}" y="{pt+15}" font-size="16" font-weight="bold">Legend</text>')
+    ly = pt + 40
     for i, (name, ts, hs) in enumerate(prepared):
         c = colors[i % len(colors)]
         if ts:
-            svg.append(f'<line x1="{legend_x}" y1="{ly-4}" x2="{legend_x+22}" y2="{ly-4}" stroke="{c}" stroke-width="2"/>')
-            svg.append(f'<text x="{legend_x+28}" y="{ly}" font-size="10">{esc(name)} – Temp (°C)</text>')
-            ly += 15
+            svg.append(f'<line x1="{legend_x}" y1="{ly-5}" x2="{legend_x+30}" y2="{ly-5}" stroke="{c}" stroke-width="2.5"/>')
+            svg.append(f'<text x="{legend_x+38}" y="{ly}" font-size="14">{esc(name)} – Temp (°C)</text>')
+            ly += 22
         if hs:
-            svg.append(f'<line x1="{legend_x}" y1="{ly-4}" x2="{legend_x+22}" y2="{ly-4}" stroke="{c}" stroke-width="2" stroke-dasharray="4 4"/>')
-            svg.append(f'<text x="{legend_x+28}" y="{ly}" font-size="10">{esc(name)} – Humidity (%)</text>')
-            ly += 15
-        ly += 3
+            svg.append(f'<line x1="{legend_x}" y1="{ly-5}" x2="{legend_x+30}" y2="{ly-5}" stroke="{c}" stroke-width="2.5" stroke-dasharray="6 5"/>')
+            svg.append(f'<text x="{legend_x+38}" y="{ly}" font-size="14">{esc(name)} – Humidity (%)</text>')
+            ly += 22
+        ly += 6
 
     svg.append(f'<line x1="{pl}" y1="{H-pb}" x2="{W-pr}" y2="{H-pb}" stroke="#333"/>')
     svg.append(f'<line x1="{pl}" y1="{pt}" x2="{pl}" y2="{H-pb}" stroke="#333"/>')
