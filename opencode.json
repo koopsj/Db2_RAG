@@ -1,0 +1,35 @@
+{
+  "$schema": "https://opencode.ai",
+  "model": "colibri/qwen3.6-colibri",
+  "provider": {
+    "colibri": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Colibri (Local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "none"
+      },
+      "models": {
+        "qwen3.6-colibri": {
+          "name": "Qwen 3.6 35B-A3B (Colibri)"
+        }
+      }
+    }
+  },
+  "mcp": {
+    "servers": {
+      "db2-server": {
+        "type": "local",
+        "command": [
+          "/home/jkoops/pyenv/bin/python",
+          "/home/jkoops/db2-mcp-server/db2_mcp_server.py"
+        ],
+        "environment": {
+          "DB2_ALLOW_WRITE": "1"
+        },
+        "enabled": true
+      }
+    }
+  }
+}
+
