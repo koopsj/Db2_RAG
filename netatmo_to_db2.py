@@ -35,7 +35,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
@@ -43,6 +43,7 @@ from sqlalchemy import create_engine, text
 
 NETATMO_TOKEN_URL = "https://api.netatmo.com/oauth2/token"
 NETATMO_STATIONS_URL = "https://api.netatmo.com/api/getstationsdata"
+NETATMO_MEASURE_URL = "https://api.netatmo.com/api/getmeasure"
 
 
 def env(name: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
@@ -126,7 +127,6 @@ def flatten_measures(stations_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             module_id = mod.get("_id")
             module_name = mod.get("module_name")
             module_type = mod.get("type")
-            data_type = mod.get("data_type") or []
             dashboard = mod.get("dashboard_data") or {}
             if not dashboard:
                 continue
@@ -152,6 +152,110 @@ def flatten_measures(stations_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 if key in dashboard:
                     row[key] = dashboard.get(key)
             rows.append(row)
+    return rows
+
+
+def iter_station_modules(stations_payload: Dict[str, Any]):
+    """Yield (device_id, station_name, home_name, module_id, module_name, module_type, data_types)."""
+    body = stations_payload.get("body", {})
+    devices = body.get("devices", []) or []
+    for dev in devices:
+        device_id = dev.get("_id")
+        station_name = dev.get("station_name") or dev.get("module_name")
+        home_name = dev.get("home_name")
+        modules = [dev] + (dev.get("modules", []) or [])
+        for mod in modules:
+            data_types = mod.get("data_type") or []
+            if not data_types:
+                continue
+            yield (
+                device_id,
+                station_name,
+                home_name,
+                mod.get("_id"),
+                mod.get("module_name"),
+                mod.get("type"),
+                list(data_types),
+            )
+
+
+def fetch_historical_measures(
+    session: requests.Session,
+    access_token: str,
+    device_id: str,
+    module_id: str,
+    scale: str,
+    mtypes: List[str],
+    date_begin: int,
+    date_end: int,
+) -> List[Dict[str, Any]]:
+    params = {
+        "access_token": access_token,
+        "device_id": device_id,
+        "scale": scale,
+        "type": ",".join(mtypes),
+        "date_begin": date_begin,
+        "date_end": date_end,
+        "optimize": "false",
+        "real_time": "false",
+    }
+    # For main/indoor module, module_id is same as device_id and must not be passed in some cases;
+    # Netatmo accepts omitting module_id for station, but safer: include when different.
+    if module_id and module_id != device_id:
+        params["module_id"] = module_id
+    resp = session.get(NETATMO_MEASURE_URL, params=params, timeout=60)
+    if not resp.ok:
+        raise RuntimeError(f"getmeasure failed {resp.status_code}: {resp.text}")
+    payload = resp.json()
+    body = payload.get("body")
+    if body is None:
+        return []
+    # optimize=false -> list of {beg_time, step_time, value: [[...], ...]}
+    if isinstance(body, dict):
+        # sometimes optimized form {timestamp: [values]}
+        out = []
+        for ts, vals in body.items():
+            if isinstance(vals, list):
+                out.append({"beg_time": int(ts), "step_time": 0, "value": [vals]})
+        return out
+    if isinstance(body, list):
+        return body
+    return []
+
+
+def flatten_historical(stations_payload: Dict[str, Any], session: requests.Session, access_token: str,
+                       date_begin: int, date_end: int, scale: str = "30min") -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    seen_meta = {}
+    for device_id, station_name, home_name, module_id, module_name, module_type, data_types in iter_station_modules(stations_payload):
+        meta = {
+            "station_id": device_id,
+            "station_name": station_name,
+            "home_name": home_name,
+            "module_id": module_id,
+            "module_name": module_name,
+            "module_type": module_type,
+        }
+        # getmeasure 'type' must be subset of available types for module
+        try:
+            chunks = fetch_historical_measures(session, access_token, device_id, module_id, scale, data_types, date_begin, date_end)
+        except Exception as e:
+            print(f"History fetch failed for module {module_name} ({module_id}): {e}", file=sys.stderr)
+            continue
+        for chunk in chunks:
+            beg = int(chunk.get("beg_time", 0))
+            step = int(chunk.get("step_time", 0) or 0)
+            values = chunk.get("value") or []
+            for i, vals in enumerate(values):
+                ts = beg + i * step
+                row = dict(meta)
+                row["measure_time_utc"] = _ts_to_utc(ts)
+                raw = {"beg_time": beg, "step_time": step, "types": data_types, "values": vals}
+                row["raw_dashboard"] = json.dumps(raw, ensure_ascii=False)
+                for idx, t in enumerate(data_types):
+                    if idx < len(vals):
+                        row[t] = vals[idx]
+                rows.append(row)
     return rows
 
 
@@ -318,14 +422,20 @@ def insert_rows(engine, rows: Iterable[Dict[str, Any]]) -> int:
     return inserted
 
 
-def run_once(engine) -> int:
+def run_once(engine, with_history: bool = False, history_days: int = 30, history_scale: str = "30min") -> int:
     device_id = env("NETATMO_DEVICE_ID")
     with requests.Session() as session:
         token = get_access_token(session)
         payload = fetch_stations_data(session, token, device_id=device_id)
-    rows = flatten_measures(payload)
+        rows = flatten_measures(payload)
+        if with_history:
+            now = int(datetime.now(timezone.utc).timestamp())
+            date_begin = now - history_days * 24 * 3600
+            hist_rows = flatten_historical(payload, session, token, date_begin, now, scale=history_scale)
+            print(f"Fetched {len(hist_rows)} historical readings ({history_days}d, scale={history_scale})")
+            rows.extend(hist_rows)
     inserted = insert_rows(engine, rows)
-    print(f"Fetched {len(rows)} module readings; insert attempted (new rows best-effort): {inserted}")
+    print(f"Fetched/processed {len(rows)} rows total; insert attempted (new rows best-effort): {inserted}")
     return inserted
 
 
@@ -334,6 +444,9 @@ def main() -> int:
     ap.add_argument("--create-table", action="store_true", help="Create target table and exit")
     ap.add_argument("--once", action="store_true", help="Run one fetch/insert cycle and exit")
     ap.add_argument("--interval", type=int, default=int(env("POLL_INTERVAL_SECONDS", "300")), help="Polling interval seconds (default 300)")
+    ap.add_argument("--with-history", action="store_true", help="Also fetch historical measures (getmeasure) and insert")
+    ap.add_argument("--history-days", type=int, default=int(env("HISTORY_DAYS", "30")), help="Days of history to fetch when --with-history (default 30)")
+    ap.add_argument("--history-scale", default=env("HISTORY_SCALE", "30min"), help="Scale for historical data: max,30min,1hour,3hours,1day,1week,1month (default 30min)")
     args = ap.parse_args()
 
     try:
@@ -348,13 +461,13 @@ def main() -> int:
             return 0
 
         if args.once:
-            run_once(engine)
+            run_once(engine, with_history=args.with_history, history_days=args.history_days, history_scale=args.history_scale)
             return 0
 
         print(f"Starting Netatmo -> Db2 poller (interval {args.interval}s, table {qualified_table_name()})")
         while True:
             try:
-                run_once(engine)
+                run_once(engine, with_history=args.with_history, history_days=args.history_days, history_scale=args.history_scale)
             except Exception as e:
                 print(f"Cycle error: {e}", file=sys.stderr)
             time.sleep(max(30, args.interval))
