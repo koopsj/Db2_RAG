@@ -13,7 +13,7 @@ DB2_HOST = "localhost"
 DB2_PORT = 50050
 DB2_DATABASE = "dbcdw"
 DB2_USER = "db2inst1"
-DB2_PASSWORD = "Babalu07"
+DB2_PASSWORD = "<secretepw>"
 
 # Construct connection string for ibm_db_sa
 # Format: ibm_db_sa://{user}:{password}@{host}:{port}/{database}
