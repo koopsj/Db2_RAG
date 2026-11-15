@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate temperature plots for all rooms/modules from Netatmo data stored in IBM Db2.
+Generate temperature (and humidity) plots for all rooms/modules from Netatmo data stored in IBM Db2.
 
 Requirements:
   pip install sqlalchemy ibm_db ibm_db_sa
@@ -21,6 +21,9 @@ Usage:
   python plot_netatmo_temperatures.py --format svg
   python plot_netatmo_temperatures.py --format png   # requires matplotlib
   python plot_netatmo_temperatures.py --combined      # also create one combined plot
+  python plot_netatmo_temperatures.py --no-humidity   # plot temperature only
+
+Note: per-room plots show Temperature as a solid line (left axis, °C) and Humidity as a dotted line (right axis, %) when available.
 """
 from __future__ import annotations
 
@@ -73,7 +76,7 @@ def fetch_modules(engine, table: str) -> List[Dict[str, Any]]:
                MIN(MEASURE_TIME_UTC) AS MIN_T,
                MAX(MEASURE_TIME_UTC) AS MAX_T
         FROM {table}
-        WHERE TEMPERATURE IS NOT NULL
+        WHERE TEMPERATURE IS NOT NULL OR HUMIDITY IS NOT NULL
         GROUP BY MODULE_NAME, MODULE_TYPE, MODULE_ID
         ORDER BY MODULE_NAME
     """)
@@ -82,29 +85,29 @@ def fetch_modules(engine, table: str) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def fetch_series(engine, table: str, module_id: Optional[str], module_name: Optional[str]) -> List[Tuple[datetime.datetime, float]]:
-    # Prefer module_id for uniqueness; fall back to module_name
+def fetch_series(engine, table: str, module_id: Optional[str], module_name: Optional[str]) -> List[Tuple[datetime.datetime, Optional[float], Optional[float]]]:
+    # Returns (time, temperature, humidity)
     if module_id:
         q = text(f"""
-            SELECT MEASURE_TIME_UTC, TEMPERATURE
+            SELECT MEASURE_TIME_UTC, TEMPERATURE, HUMIDITY
             FROM {table}
-            WHERE MODULE_ID = :mid AND TEMPERATURE IS NOT NULL
+            WHERE MODULE_ID = :mid AND (TEMPERATURE IS NOT NULL OR HUMIDITY IS NOT NULL)
             ORDER BY MEASURE_TIME_UTC
         """)
         params = {"mid": module_id}
     else:
         q = text(f"""
-            SELECT MEASURE_TIME_UTC, TEMPERATURE
+            SELECT MEASURE_TIME_UTC, TEMPERATURE, HUMIDITY
             FROM {table}
-            WHERE MODULE_NAME = :mname AND TEMPERATURE IS NOT NULL
+            WHERE MODULE_NAME = :mname AND (TEMPERATURE IS NOT NULL OR HUMIDITY IS NOT NULL)
             ORDER BY MEASURE_TIME_UTC
         """)
         params = {"mname": module_name}
     with engine.connect() as conn:
         rows = conn.execute(q, params).all()
     out = []
-    for t, v in rows:
-        if t is None or v is None:
+    for t, temp, hum in rows:
+        if t is None:
             continue
         if isinstance(t, str):
             try:
@@ -115,35 +118,58 @@ def fetch_series(engine, table: str, module_id: Optional[str], module_name: Opti
             t = t.to_pydatetime()
         if isinstance(t, datetime.datetime) and t.tzinfo is not None:
             t = t.replace(tzinfo=None)
+        tv = hv = None
         try:
-            out.append((t, float(v)))
+            if temp is not None:
+                tv = float(temp)
         except Exception:
-            pass
+            tv = None
+        try:
+            if hum is not None:
+                hv = float(hum)
+        except Exception:
+            hv = None
+        if tv is None and hv is None:
+            continue
+        out.append((t, tv, hv))
     return out
 
 
-def plot_svg(series: List[Tuple[datetime.datetime, float]], title: str, outpath: str) -> None:
+def plot_svg(series: List[Tuple[datetime.datetime, Optional[float], Optional[float]]], title: str, outpath: str, show_humidity: bool = True) -> None:
     if not series:
         return
     xs = [p[0] for p in series]
-    ys = [p[1] for p in series]
-    W, H, pl, pr, pt, pb = 900, 360, 70, 30, 40, 60
+    tpts = [(p[0], p[1]) for p in series if p[1] is not None]
+    hpts = [(p[0], p[2]) for p in series if show_humidity and p[2] is not None]
+    if not tpts and not hpts:
+        return
+    ys_t = [v for _, v in tpts] if tpts else [0.0]
+    ys_h = [v for _, v in hpts] if hpts else [0.0]
+    W, H, pl, pr, pt, pb = 920, 360, 70, 60, 40, 60
     xmin, xmax = min(xs), max(xs)
-    ymin = min(ys) - 0.5
-    ymax = max(ys) + 0.5
+    ymin_t = min(ys_t) - 0.5 if tpts else 0.0
+    ymax_t = max(ys_t) + 0.5 if tpts else 1.0
+    if hpts:
+        ymin_h = max(0.0, min(ys_h) - 5.0)
+        ymax_h = min(100.0, max(ys_h) + 5.0)
+        if ymax_h <= ymin_h:
+            ymin_h, ymax_h = 0.0, 100.0
+    else:
+        ymin_h, ymax_h = 0.0, 100.0
     if xmax == xmin:
         xmax = xmin + datetime.timedelta(seconds=1)
-    if ymax == ymin:
-        ymax = ymin + 1.0
+    if ymax_t == ymin_t:
+        ymax_t = ymin_t + 1.0
 
     def sx(x):
         return pl + (x - xmin).total_seconds() / (xmax - xmin).total_seconds() * (W - pl - pr)
 
-    def sy(y):
-        return H - pb - (y - ymin) / (ymax - ymin) * (H - pt - pb)
+    def sy_t(y):
+        return H - pb - (y - ymin_t) / (ymax_t - ymin_t) * (H - pt - pb)
 
-    pts = " ".join(f"{sx(x):.2f},{sy(y):.2f}" for x, y in zip(xs, ys))
-    # x ticks ~6
+    def sy_h(y):
+        return H - pb - (y - ymin_h) / (ymax_h - ymin_h) * (H - pt - pb)
+
     total_sec = max(1.0, (xmax - xmin).total_seconds())
     step_sec = max(3600, int(total_sec / 6 / 3600) * 3600)
     ticks = []
@@ -153,7 +179,7 @@ def plot_svg(series: List[Tuple[datetime.datetime, float]], title: str, outpath:
         t += datetime.timedelta(seconds=step_sec)
     if not ticks or ticks[-1] < xmax:
         ticks.append(xmax)
-    gridy = [ymin + i * (ymax - ymin) / 5 for i in range(6)]
+    gridy = [ymin_t + i * (ymax_t - ymin_t) / 5 for i in range(6)]
 
     def esc(s):
         return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -161,40 +187,83 @@ def plot_svg(series: List[Tuple[datetime.datetime, float]], title: str, outpath:
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" font-family="sans-serif">']
     svg.append('<rect width="100%" height="100%" fill="white"/>')
     svg.append(f'<text x="{W/2}" y="20" text-anchor="middle" font-size="16" font-weight="bold">{esc(title)}</text>')
+    # left axis grid (temperature)
     for gy in gridy:
-        y = sy(gy)
+        y = sy_t(gy)
         svg.append(f'<line x1="{pl}" y1="{y:.2f}" x2="{W-pr}" y2="{y:.2f}" stroke="#ddd"/>')
-        svg.append(f'<text x="{pl-8}" y="{y+4:.2f}" text-anchor="end" font-size="11">{gy:.1f}°C</text>')
+        svg.append(f'<text x="{pl-8}" y="{y+4:.2f}" text-anchor="end" font-size="11" fill="#d62728">{gy:.1f}°C</text>')
+    # right axis (humidity)
+    if hpts:
+        gridh = [ymin_h + i * (ymax_h - ymin_h) / 5 for i in range(6)]
+        for gh in gridh:
+            y = sy_h(gh)
+            svg.append(f'<text x="{W-pr+8}" y="{y+4:.2f}" text-anchor="start" font-size="11" fill="#1f77b4">{gh:.0f}%</text>')
+    # x ticks
     for tx in ticks:
         x = sx(tx)
         svg.append(f'<line x1="{x:.2f}" y1="{H-pb}" x2="{x:.2f}" y2="{H-pb+5}" stroke="#333"/>')
         fmt = "%m-%d %H:%M" if total_sec <= 3 * 86400 else "%Y-%m-%d"
         svg.append(f'<text x="{x:.2f}" y="{H-pb+18}" text-anchor="middle" font-size="10">{tx.strftime(fmt)}</text>')
-    svg.append(f'<polyline fill="none" stroke="#d62728" stroke-width="2" points="{pts}"/>')
-    r = 2.5 if len(xs) < 200 else 1.5
-    for x, y in zip(xs, ys):
-        svg.append(f'<circle cx="{sx(x):.2f}" cy="{sy(y):.2f}" r="{r}" fill="#d62728"/>')
+    # temperature (solid)
+    if tpts:
+        pts_t = " ".join(f"{sx(x):.2f},{sy_t(y):.2f}" for x, y in tpts)
+        svg.append(f'<polyline fill="none" stroke="#d62728" stroke-width="2" points="{pts_t}"/>')
+        r = 2.5 if len(tpts) < 200 else 1.5
+        for x, y in tpts:
+            svg.append(f'<circle cx="{sx(x):.2f}" cy="{sy_t(y):.2f}" r="{r}" fill="#d62728"/>')
+    # humidity (dotted)
+    if hpts:
+        pts_h = " ".join(f"{sx(x):.2f},{sy_h(y):.2f}" for x, y in hpts)
+        svg.append(f'<polyline fill="none" stroke="#1f77b4" stroke-width="2" stroke-dasharray="4 4" points="{pts_h}"/>')
+        r = 2.0 if len(hpts) < 200 else 1.2
+        for x, y in hpts:
+            svg.append(f'<circle cx="{sx(x):.2f}" cy="{sy_h(y):.2f}" r="{r}" fill="#1f77b4"/>')
+    # legend
+    lx, ly = pl + 10, pt + 10
+    svg.append(f'<rect x="{lx-6}" y="{ly-10}" width="170" height="{34 if hpts else 18}" fill="white" stroke="#ccc"/>')
+    svg.append(f'<line x1="{lx}" y1="{ly}" x2="{lx+20}" y2="{ly}" stroke="#d62728" stroke-width="2"/>')
+    svg.append(f'<text x="{lx+26}" y="{ly+4}" font-size="11">Temperature (°C)</text>')
+    if hpts:
+        svg.append(f'<line x1="{lx}" y1="{ly+16}" x2="{lx+20}" y2="{ly+16}" stroke="#1f77b4" stroke-width="2" stroke-dasharray="4 4"/>')
+        svg.append(f'<text x="{lx+26}" y="{ly+20}" font-size="11">Humidity (%)</text>')
+
     svg.append(f'<line x1="{pl}" y1="{H-pb}" x2="{W-pr}" y2="{H-pb}" stroke="#333"/>')
     svg.append(f'<line x1="{pl}" y1="{pt}" x2="{pl}" y2="{H-pb}" stroke="#333"/>')
+    if hpts:
+        svg.append(f'<line x1="{W-pr}" y1="{pt}" x2="{W-pr}" y2="{H-pb}" stroke="#333"/>')
     svg.append('</svg>')
     with open(outpath, "w", encoding="utf-8") as f:
         f.write("\n".join(svg))
 
 
-def plot_png(series: List[Tuple[datetime.datetime, float]], title: str, outpath: str) -> None:
+def plot_png(series: List[Tuple[datetime.datetime, Optional[float], Optional[float]]], title: str, outpath: str, show_humidity: bool = True) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
 
     xs = [p[0] for p in series]
-    ys = [p[1] for p in series]
+    tpts = [(p[0], p[1]) for p in series if p[1] is not None]
+    hpts = [(p[0], p[2]) for p in series if show_humidity and p[2] is not None]
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(xs, ys, marker="o", markersize=3, linewidth=1.2, color="#d62728")
-    ax.set_title(title)
-    ax.set_ylabel("Temperature (°C)")
+    if tpts:
+        ax.plot([x for x, _ in tpts], [y for _, y in tpts], marker="o", markersize=3, linewidth=1.2, color="#d62728", label="Temperature (°C)")
+    ax.set_ylabel("Temperature (°C)", color="#d62728")
+    ax.tick_params(axis="y", labelcolor="#d62728")
     ax.set_xlabel("Time (UTC)")
     ax.grid(True, alpha=0.3)
+    if hpts:
+        ax2 = ax.twinx()
+        ax2.plot([x for x, _ in hpts], [y for _, y in hpts], linestyle=":", marker="o", markersize=2.5, linewidth=1.2, color="#1f77b4", label="Humidity (%)")
+        ax2.set_ylabel("Humidity (%)", color="#1f77b4")
+        ax2.tick_params(axis="y", labelcolor="#1f77b4")
+        # combined legend
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax2.legend(lines1 + lines2, labels1 + labels2, loc="best")
+    elif tpts:
+        ax.legend(loc="best")
+    ax.set_title(title)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -202,15 +271,19 @@ def plot_png(series: List[Tuple[datetime.datetime, float]], title: str, outpath:
     plt.close(fig)
 
 
-def plot_combined_svg(all_series: List[Tuple[str, List[Tuple[datetime.datetime, float]]]], outpath: str) -> None:
-    # Simple combined SVG with distinct colors
+def plot_combined_svg(all_series: List[Tuple[str, List[Tuple[datetime.datetime, Optional[float], Optional[float]]]]], outpath: str, show_humidity: bool = True) -> None:
+    # Combined temperature plot per room (humidity omitted for clarity)
     colors = ["#d62728", "#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#8c564b", "#17becf", "#e377c2"]
-    nonempty = [(n, s) for n, s in all_series if s]
+    nonempty = []
+    for name, s in all_series:
+        t = [(p[0], p[1]) for p in s if p[1] is not None]
+        if t:
+            nonempty.append((name, t))
     if not nonempty:
         return
     all_x = [p[0] for _, s in nonempty for p in s]
     all_y = [p[1] for _, s in nonempty for p in s]
-    W, H, pl, pr, pt, pb = 1000, 420, 70, 160, 40, 60
+    W, H, pl, pr, pt, pb = 1000, 420, 70, 170, 40, 60
     xmin, xmax = min(all_x), max(all_x)
     ymin, ymax = min(all_y) - 0.5, max(all_y) + 0.5
     if xmax == xmin:
@@ -229,7 +302,8 @@ def plot_combined_svg(all_series: List[Tuple[str, List[Tuple[datetime.datetime, 
 
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" font-family="sans-serif">']
     svg.append('<rect width="100%" height="100%" fill="white"/>')
-    svg.append(f'<text x="{(W-pr)/2+pl/2}" y="20" text-anchor="middle" font-size="16" font-weight="bold">All rooms – Temperature (UTC)</text>')
+    subtitle = " (temperature; per-room plots include humidity)" if show_humidity else ""
+    svg.append(f'<text x="{(W-pr)/2+pl/2}" y="20" text-anchor="middle" font-size="16" font-weight="bold">All rooms – Temperature (UTC){esc(subtitle)}</text>')
     gridy = [ymin + i * (ymax - ymin) / 5 for i in range(6)]
     for gy in gridy:
         y = sy(gy)
@@ -257,10 +331,11 @@ def plot_combined_svg(all_series: List[Tuple[str, List[Tuple[datetime.datetime, 
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Generate temperature plots for all rooms from Db2 Netatmo data.")
+    ap = argparse.ArgumentParser(description="Generate temperature and humidity plots for all rooms from Db2 Netatmo data.")
     ap.add_argument("--outdir", default=env("PLOT_OUTDIR", "/tmp/opencode/netatmo_plots"), help="Output directory for plots")
     ap.add_argument("--format", choices=["svg", "png"], default="svg", help="Output format (png requires matplotlib)")
-    ap.add_argument("--combined", action="store_true", help="Also generate a combined plot of all rooms")
+    ap.add_argument("--combined", action="store_true", help="Also generate a combined plot (temperature per room)")
+    ap.add_argument("--no-humidity", action="store_true", help="Plot temperature only (omit humidity)")
     ap.add_argument("--table", default=None, help="Override qualified table name (e.g. DB2INST1.NETATMO_MEASURES)")
     args = ap.parse_args()
 
@@ -268,10 +343,11 @@ def main() -> int:
         engine = make_engine()
         table = args.table or qualified_table_name()
         os.makedirs(args.outdir, exist_ok=True)
+        show_humidity = not args.no_humidity
 
         modules = fetch_modules(engine, table)
         if not modules:
-            print(f"No modules with temperature data found in {table}")
+            print(f"No modules with temperature/humidity data found in {table}")
             return 1
 
         all_series = []
@@ -283,26 +359,26 @@ def main() -> int:
                 print(f"Skip {name}: no points")
                 continue
             label = f"{name} ({m.get('MODULE_TYPE')})" if m.get("MODULE_TYPE") else name
-            title = f"{label} – Temperature (UTC)"
-            fname = safe_filename(name) + ("_temperature." + args.format)
+            has_h = any(p[2] is not None for p in series) and show_humidity
+            title = f"{label} – Temperature{' & Humidity' if has_h else ''} (UTC)"
+            suffix = "_temp_humidity." if has_h else "_temperature."
+            fname = safe_filename(name) + suffix + args.format
             outpath = os.path.join(args.outdir, fname)
             if args.format == "png":
                 try:
-                    plot_png(series, title, outpath)
+                    plot_png(series, title, outpath, show_humidity=show_humidity)
                 except Exception as e:
                     print(f"PNG failed for {name} ({e}), falling back to SVG", file=sys.stderr)
                     outpath = os.path.splitext(outpath)[0] + ".svg"
-                    plot_svg(series, title, outpath)
+                    plot_svg(series, title, outpath, show_humidity=show_humidity)
             else:
-                plot_svg(series, title, outpath)
+                plot_svg(series, title, outpath, show_humidity=show_humidity)
             print(f"Wrote {outpath} ({len(series)} points, {series[0][0]} -> {series[-1][0]})")
             all_series.append((name, series))
 
         if args.combined and all_series:
-            cpath = os.path.join(args.outdir, "all_rooms_temperature." + ("svg" if args.format != "png" else "svg"))
-            # combined as SVG for simplicity
             cpath = os.path.join(args.outdir, "all_rooms_temperature.svg")
-            plot_combined_svg(all_series, cpath)
+            plot_combined_svg(all_series, cpath, show_humidity=show_humidity)
             print(f"Wrote {cpath} (combined)")
 
         print(f"Done. {len(all_series)} room plot(s) in {args.outdir}")
