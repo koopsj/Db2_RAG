@@ -263,3 +263,106 @@ ORDER BY PAGE_NUM, CHUNK_INDEX;
 
 **D. Changing model/dimension (if ever needed)**
 - Choose new model+dim, `ALTER`/recreate `EMBEDDING` as `VECTOR(<new_dim>, FLOAT32)` as appropriate, regenerate embeddings for **all** rows with the new model, and ensure query-time embeddings use the same model/dim/normalization. (Not performed; current setup remains 384-dim MiniLM.)
+
+### 8.3 How to query now (examples: SSL setup, WLM/workload setup)
+
+Two retrieval modes are available: **semantic (vector)** and **lexical (text/keyword)**. They can be combined (hybrid). Use `db2-server` `query_db2` for SQL, or a Python Db2 client for vector queries that need a generated query embedding.
+
+#### A. Lexical search via `db2-server` (immediate, no embedding step)
+Works on `CHUNK_TEXT` regardless of `EMBEDDING` backfill status.
+
+**Example — SSL/TLS server setup (`db2_sec_guide_1213`):**
+```sql
+SELECT DOC_ID, CHUNK_ID, PAGE_NUM,
+       SUBSTR(CAST(CHUNK_TEXT AS VARCHAR(3500)),1,3500) AS TEXT_SNIPPET
+FROM DB2INST1.DB2_INFO_CENTER
+WHERE DOC_ID = 'db2_sec_guide_1213'
+  AND (UPPER(CAST(CHUNK_TEXT AS VARCHAR(10000))) LIKE '%SSL_SVR_KEYDB%'
+       OR UPPER(CAST(CHUNK_TEXT AS VARCHAR(10000))) LIKE '%DB2COMM%SSL%'
+       OR UPPER(CAST(CHUNK_TEXT AS VARCHAR(10000))) LIKE '%SSL_SVCENAME%')
+ORDER BY PAGE_NUM, CHUNK_INDEX
+FETCH FIRST 10 ROWS ONLY;
+```
+*Typical relevant pages:* p.164, 167–168 (create/configure keystore & cert via GSKit, set `SSL_SVR_KEYDB/SSL_SVR_STASH/SSL_SVR_LABEL`, `SSL_SVCENAME`, optional `SSL_VERSIONS/SSL_CIPHERSPECS`, set `DB2COMM=SSL` or `SSL,TCPIP`, then `db2stop`/`db2start`).
+
+**Example — WLM/workload setup:**
+```sql
+SELECT DOC_ID, CHUNK_ID, PAGE_NUM,
+       SUBSTR(CAST(CHUNK_TEXT AS VARCHAR(3500)),1,3500) AS TEXT_SNIPPET
+FROM DB2INST1.DB2_INFO_CENTER
+WHERE UPPER(CAST(CHUNK_TEXT AS VARCHAR(10000))) LIKE '%CREATE WORKLOAD%'
+   OR UPPER(CAST(CHUNK_TEXT AS VARCHAR(10000))) LIKE '%CREATE SERVICE CLASS%'
+   OR UPPER(CAST(CHUNK_TEXT AS VARCHAR(10000))) LIKE '%WORKLOAD MANAG%'
+ORDER BY DOC_ID, PAGE_NUM, CHUNK_INDEX
+FETCH FIRST 10 ROWS ONLY;
+```
+*Narrow further with* `DOC_ID IN (...)` (e.g. performance/admin guides) or add terms like `'%COLLECT ACTIVITY DATA%'`, `'%WLM_COLLECT_INT%'`, `'%SERVICE CLASS%THRESHOLD%'` depending on the exact setup needed.
+
+#### B. Semantic (vector) search (uses `EMBEDDING`)
+Requires: (1) a **query embedding** generated with the same model/dim/normalization, and (2) rows where `EMBEDDING IS NOT NULL`.
+
+**1) Generate a query embedding (Python, same env/model):**
+```python
+from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+question = "How to configure SSL TLS on Db2 server (keystore, certificate, SSL_SVCENAME, DB2COMM)?"
+qvec = model.encode([question], normalize_embeddings=True)[0]
+qvec_str = "[" + ",".join(f"{float(x):.8f}" for x in qvec) + "]"  # 384 values
+```
+
+**2) Query Db2 by similarity** (replace `<QVEC>` with `qvec_str`):
+```sql
+-- Example: SSL setup (semantic)
+SELECT CHUNK_ID, DOC_ID, PAGE_NUM,
+       SUBSTR(CAST(CHUNK_TEXT AS VARCHAR(2500)),1,2500) AS TEXT_SNIPPET,
+       VECTOR_DISTANCE(EMBEDDING, VECTOR('<QVEC>', 384, FLOAT32), COSINE) AS dist
+FROM DB2INST1.DB2_INFO_CENTER
+WHERE EMBEDDING IS NOT NULL
+  AND (DOC_ID = 'db2_sec_guide_1213' OR DOC_ID LIKE '%sec%')  -- optional prefilter
+ORDER BY dist
+FETCH FIRST 5 ROWS ONLY;
+
+-- Example: WLM/workload setup (semantic)
+SELECT CHUNK_ID, DOC_ID, PAGE_NUM,
+       SUBSTR(CAST(CHUNK_TEXT AS VARCHAR(2500)),1,2500) AS TEXT_SNIPPET,
+       VECTOR_DISTANCE(EMBEDDING, VECTOR('<QVEC>', 384, FLOAT32), COSINE) AS dist
+FROM DB2INST1.DB2_INFO_CENTER
+WHERE EMBEDDING IS NOT NULL
+ORDER BY dist
+FETCH FIRST 5 ROWS ONLY;
+```
+> **Tip:** Prefilter by `DOC_ID`/keywords when you know the domain (faster and often more precise). Metric shown is `COSINE` (appropriate with normalized embeddings); adjust if needed.
+
+**3) End-to-end example (Python: embed + query + print top chunks):**
+```python
+import ibm_db_dbi
+from sentence_transformers import SentenceTransformer
+
+question = "How to create and configure Db2 WLM service class, workload and collect activity data?"
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+qvec = "[" + ",".join(f"{float(x):.8f}" for x in model.encode([question], normalize_embeddings=True)[0]) + "]"
+
+conn = ibm_db_dbi.connect(
+    "DATABASE=dbcdw;HOSTNAME=localhost;PORT=50050;PROTOCOL=TCPIP;UID=db2inst1;PWD=<password>;", "", ""
+)
+cur = conn.cursor()
+sql = f"""
+SELECT CHUNK_ID, DOC_ID, PAGE_NUM,
+       SUBSTR(CAST(CHUNK_TEXT AS VARCHAR(2500)),1,2500) AS SNIP,
+       VECTOR_DISTANCE(EMBEDDING, VECTOR('{qvec}', 384, FLOAT32), COSINE) AS dist
+FROM DB2INST1.DB2_INFO_CENTER
+WHERE EMBEDDING IS NOT NULL
+ORDER BY dist FETCH FIRST 5 ROWS ONLY
+"""
+cur.execute(sql)
+for row in cur.fetchall():
+    print(row[1], row[0], "p."+str(row[2]), "dist=", row[4])
+    print(row[3][:800], "...\n")
+```
+Run with the Python env that has `sentence-transformers` and `ibm_db` (e.g. `/home/jkoops/pyenv/bin/python`), and set correct Db2 credentials.
+
+#### C. Recommended practice (answering from RAG)
+- Retrieve top chunks (semantic and/or lexical), read/cite `DOC_ID, CHUNK_ID, PAGE_NUM`.
+- Synthesize the answer from retrieved text; if live instance state/config is required, verify against the actual Db2 instance/catalog (docs alone cannot confirm runtime state).
+- If semantic results look sparse, check `EMBEDDING IS NOT NULL` coverage (backfill may still be running) and fall back to lexical `LIKE` searches.
