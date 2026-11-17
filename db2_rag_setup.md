@@ -2,7 +2,7 @@
 
 This document captures the **prompt**, **steps**, and **artifacts** used to set up a RAG knowledge store in IBM Db2 from PDF documents (including IBM Db2 manuals), and to query it via the OpenCode `db2-server` MCP.
 
-> **Status:** Text+metadata chunks are loaded in Db2. **Vector/embedding support has been added** to the RAG tables (`EMBEDDING VECTOR(384, FLOAT32)` using `sentence-transformers/all-MiniLM-L6-v2`, normalized). See [Section 8](#8-vector--embedding-update-nov-2026) for details and how to use it.
+> **Status:** Text+metadata chunks are loaded in Db2. **Vector/embedding support has been added** to the RAG tables (`EMBEDDING VECTOR(384, FLOAT32)` using `sentence-transformers/all-MiniLM-L6-v2`, normalized). Query embeddings can be generated via `sentence-transformers` or locally via **Ollama (`all-minilm`, 384-dim)**. See [Section 8](#8-vector--embedding-update-nov-2026) for details and how to use it.
 
 ---
 
@@ -202,6 +202,7 @@ ORDER BY PAGE_NUM, CHUNK_INDEX;
 - `/tmp/opencode/db2_manuals/` (downloaded manuals)
 - `/tmp/opencode/load_db2_info_center.py`, `/tmp/opencode/load_all_db2_manuals.py`
 - `/tmp/opencode/add_vectors_db2_info_center.py`, `/tmp/opencode/add_vectors_doc_chunks.py` (embedding generation/backfill scripts)
+- `/tmp/opencode/query_rag_ollama.py` (query-time semantic search using local Ollama `all-minilm` embeddings + Db2 `VECTOR_DISTANCE`)
 - Db2 tables: `DB2INST1.DOCUMENT_CHUNKS_PDF`, `DB2INST1.DB2_INFO_CENTER` (with `EMBEDDING VECTOR(384,FLOAT32)`)
 
 ---
@@ -223,12 +224,13 @@ ORDER BY PAGE_NUM, CHUNK_INDEX;
   SET EMBEDDING = VECTOR('<[v1,...,v384]>', 384, FLOAT32)
   WHERE CHUNK_ID = ?;
   ```
-- **Population status (at update time):** `DOCUMENT_CHUNKS_PDF` fully embedded (**27/27**). `DB2_INFO_CENTER` backfill **in progress** (large table, ~39k rows) via `/tmp/opencode/add_vectors_db2_info_center.py` (log: `/tmp/opencode/add_vectors.log`, selects rows where `EMBEDDING IS NULL`, so rerunnable/resumable). Re-check with:
+- **Population status:** `DOCUMENT_CHUNKS_PDF` fully embedded (**27/27**). `DB2_INFO_CENTER` backfill **completed** (**39,211/39,211** embedded; re-check anytime):
   ```sql
   SELECT COUNT(*) AS embedded,
          (SELECT COUNT(*) FROM DB2INST1.DB2_INFO_CENTER) AS total
   FROM DB2INST1.DB2_INFO_CENTER WHERE EMBEDDING IS NOT NULL;
   ```
+  (Backfill script: `/tmp/opencode/add_vectors_db2_info_center.py`, log: `/tmp/opencode/add_vectors.log`; rerunnable/resumable via `WHERE EMBEDDING IS NULL`.)
 - **Vector index:** not created. Attempts to create an index on the `VECTOR` column failed in this environment (e.g. `SQL0350N` / `SQLSTATE 42962`, data type not supported in that context), consistent with ingested Db2 SQL reference restrictions that a `VECTOR` column cannot be part of an index. Use function-based similarity (scan) unless/until a supported vector index mechanism/syntax is available for your exact Db2 level/configuration.
 
 ### 8.2 How to act with the updated implementation (short guide)
@@ -453,3 +455,107 @@ Tokens (generated outside Db2) carry identity+proof; connect with `ACCESSTOKENTY
 
 **C. Retrieval/answering notes**
 - Cite `DOC_ID, CHUNK_ID, PAGE_NUM` from retrieved chunks. If top semantic results don’t cover a specific detail (e.g. external IdP/JWKS retrieval specifics), run follow-up semantic/lexical queries and verify against the actual Db2 12.1.5 instance and security policy.
+
+### 8.5 Querying with a local embedding model (Ollama, `all-minilm`)
+
+This provides an alternative to `sentence-transformers` for **query-time** embeddings using a local Ollama runtime. It generates the query vector locally (no HF model download at query time in Python) and uses the same Db2 `VECTOR_DISTANCE` retrieval against existing stored embeddings.
+
+> **Compatibility:** Stored embeddings are `VECTOR(384, FLOAT32)` from `sentence-transformers/all-MiniLM-L6-v2` (normalized). Ollama `all-minilm` is 384-dim (MiniLM family) and produced relevant results in validation against the existing column. For best semantic fidelity, query and stored vectors should come from the same model/runtime/normalization; if relevance drifts, re-embed stored rows with the chosen model (separate column or in-place, with approval).
+
+#### A. Download & configure (one-time setup)
+
+1. **Prerequisite:** Ollama installed and running (`http://localhost:11434`).
+   ```bash
+   ollama --version
+   curl -s http://localhost:11434/api/tags
+   ```
+2. **Pull the embedding model** (downloads to local Ollama store, ~45 MB):
+   ```bash
+   ollama pull all-minilm
+   ollama list   # verify: all-minilm:latest (384-dim embedding model)
+   ```
+3. **Verify embedding API and dimension** (expect `dim=384`):
+   ```bash
+   curl -s http://localhost:11434/api/embed -d '{
+     "model": "all-minilm",
+     "input": "How to configure JWT authentication in Db2?"
+   }' | python3 -c "import sys,json; d=json.load(sys.stdin); e=d['embeddings'][0]; print('dim=', len(e))"
+   ```
+   - Modern Ollama: `POST /api/embed` with `{"model":"all-minilm","input":"..."}` → `{"embeddings":[[...]]}`.
+   - Older Ollama variants: `POST /api/embeddings` with `{"model":"all-minilm","prompt":"..."}` → `{"embedding":[...]}` (adjust script accordingly).
+
+#### B. End-to-end query script (Ollama embed + Db2 `VECTOR_DISTANCE`)
+
+Equivalent to the `sentence-transformers` query script, but embedding is produced via local Ollama. Takes the question as a CLI argument.
+
+```python
+import json
+import sys
+import urllib.request
+import ibm_db_dbi
+
+if len(sys.argv) < 2:
+    print('Usage: python query_rag_ollama.py "<question>"')
+    sys.exit(1)
+
+question = sys.argv[1]
+OLLAMA_URL = "http://localhost:11434/api/embed"
+OLLAMA_MODEL = "all-minilm"  # 384-dim
+
+# 1) Generate query embedding locally via Ollama
+req = urllib.request.Request(
+    OLLAMA_URL,
+    data=json.dumps({"model": OLLAMA_MODEL, "input": question}).encode(),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(req) as r:
+    data = json.load(r)
+vec = data["embeddings"][0]
+qvec = "[" + ",".join(f"{float(x):.8f}" for x in vec) + "]"
+
+# 2) Semantic search in Db2
+conn = ibm_db_dbi.connect(
+    "DATABASE=dbcdw;HOSTNAME=localhost;PORT=50050;PROTOCOL=TCPIP;UID=db2inst1;PWD=<password>;",
+    "", "",
+)
+cur = conn.cursor()
+sql = f"""
+SELECT CHUNK_ID, DOC_ID, PAGE_NUM,
+       SUBSTR(CAST(CHUNK_TEXT AS VARCHAR(2500)),1,2500) AS TEXT_SNIPPET,
+       VECTOR_DISTANCE(EMBEDDING, VECTOR('{qvec}', 384, FLOAT32), COSINE) AS dist
+FROM DB2INST1.DB2_INFO_CENTER
+WHERE EMBEDDING IS NOT NULL
+ORDER BY dist
+FETCH FIRST 8 ROWS ONLY
+"""
+cur.execute(sql)
+for row in cur.fetchall():
+    print(row[1], row[0], "p." + str(row[2]), "dist=", row[4])
+    print(row[3][:800], "...\n")
+```
+
+**Run (example):**
+```bash
+/home/jkoops/pyenv/bin/python /tmp/opencode/query_rag_ollama.py "How to configure JWT authentication in Db2?"
+```
+(Requires Python with `ibm_db`/`ibm_db_dbi`, Ollama running with `all-minilm` pulled, and valid Db2 credentials.)
+
+#### C. Worked example result (local Ollama embedding, JWT question)
+
+**Question:** `How to configure JWT authentication in Db2?` (embedded via `ollama/all-minilm`, 384-dim)  
+**Query:** same `VECTOR_DISTANCE(..., COSINE)` over `DB2INST1.DB2_INFO_CENTER` (`EMBEDDING IS NOT NULL`, top 5):
+
+| Rank | Chunk | Doc | Page | Dist (COSINE) |
+|---|---|---|---:|---:|
+| 1 | `db2_sec_guide_1213_40_0` | `db2_sec_guide_1213` | 40 | 0.16485 |
+| 2 | `db2_sec_guide_1213_38_1` | `db2_sec_guide_1213` | 38 | 0.20885 |
+| 3 | `db2_sec_guide_1213_38_0` | `db2_sec_guide_1213` | 38 | 0.25258 |
+| 4 | `db2_sec_guide_1213_20_3` | `db2_sec_guide_1213` | 20 | 0.27396 |
+| 5 | `db2_sec_guide_1213_40_1` | `db2_sec_guide_1213` | 40 | 0.27406 |
+
+Retrieved snippets cover JWT/token prerequisites and client connect (p.40), `db2token.cfg`/key labels/`JWT_IDP_AUTHID_CLAIM` and issuer/keystore/algorithms (p.38), and CLP/CLI/JDBC `accesstoken`/`accesstokentype jwt` usage (p.40) — consistent with the `sentence-transformers`-based results in 8.4.
+
+#### D. Notes
+- **Same retrieval SQL:** only the query-embedding generation step changes; Db2 side remains `VECTOR_DISTANCE(EMBEDDING, VECTOR('<qvec>', 384, FLOAT32), COSINE)`.
+- **Alternative runtimes/models:** a different model or dimension (e.g. `nomic-embed-text`, 768-dim, or llama.cpp GGUF embeddings) requires compatible storage (new `VECTOR(<dim>,...)` column/table) and backfilling stored embeddings with that model before semantic search will be correct.
+- **Security/ops:** keep Db2 credentials out of committed scripts; ensure Ollama is bound appropriately (default local). Re-run lexical `LIKE` search as a fallback if needed.
