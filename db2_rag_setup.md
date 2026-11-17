@@ -1,8 +1,8 @@
 # Db2 Documentation RAG Setup (using `db2-server` MCP)
 
-This document captures the **prompt**, **steps**, and **artifacts** used to set up a text-based RAG knowledge store in IBM Db2 from PDF documents (including IBM Db2 manuals), and to query it via the OpenCode `db2-server` MCP.
+This document captures the **prompt**, **steps**, and **artifacts** used to set up a RAG knowledge store in IBM Db2 from PDF documents (including IBM Db2 manuals), and to query it via the OpenCode `db2-server` MCP.
 
-> **Scope/limitations:** This setup loads **text + metadata** chunks into Db2 (`CHUNK_TEXT`). It does **not** generate/store embeddings or a `VECTOR` column. For full vector similarity RAG, add an embedding step/model and a vector column/index supported by your Db2 version.
+> **Status:** Text+metadata chunks are loaded in Db2. **Vector/embedding support has been added** to the RAG tables (`EMBEDDING VECTOR(384, FLOAT32)` using `sentence-transformers/all-MiniLM-L6-v2`, normalized). See [Section 8](#8-vector--embedding-update-nov-2026) for details and how to use it.
 
 ---
 
@@ -10,8 +10,9 @@ This document captures the **prompt**, **steps**, and **artifacts** used to set 
 - Store PDF content as retrievable chunks in Db2.
 - Query the stored documentation via `db2-server` MCP to answer questions (e.g. monitor elements, SSL/TLS configuration) from the loaded Db2 manuals.
 - Optionally bulk-load IBM Db2 12.1 LUW English manuals.
+- Support semantic/vector similarity retrieval over stored chunks (added).
 
-**Target table (same schema used):** `DB2INST1.DB2_INFO_CENTER` (and example `DB2INST1.DOCUMENT_CHUNKS_PDF`)
+**Target tables:** `DB2INST1.DB2_INFO_CENTER` and `DB2INST1.DOCUMENT_CHUNKS_PDF`
 
 | Column | Type | Notes |
 |---|---|---|
@@ -21,6 +22,7 @@ This document captures the **prompt**, **steps**, and **artifacts** used to set 
 | `PAGE_NUM` | `INTEGER` | Page number |
 | `CHUNK_INDEX` | `INTEGER` | Chunk index within page |
 | `CHUNK_TEXT` | `CLOB(2M)` | Extracted text chunk |
+| `EMBEDDING` | `VECTOR(384, FLOAT32)` | *(added)* 384-dim embedding of `CHUNK_TEXT` (MiniLM-L6-v2, normalized) |
 
 ---
 
@@ -186,7 +188,7 @@ ORDER BY PAGE_NUM, CHUNK_INDEX;
 - **Idempotency:** reload by `DELETE FROM <TABLE> WHERE DOC_ID = ...` before inserting chunks for the same document.
 - **Performance:** bulk inserts are far faster via direct Db2 client/script than per-row MCP calls; batch inserts (e.g. 200) recommended.
 - **Extraction quality:** use text extraction for digital PDFs; OCR for scanned PDFs (quality varies).
-- **Vector RAG upgrade path:** add `EMBEDDING VECTOR(<dim>, FLOAT32)` (per Db2 version syntax), generate embeddings with a consistent model for all chunks, insert/update vectors, and retrieve with `VECTOR_DISTANCE`/similarity before prompting an LLM.
+- **Embeddings keep-in-sync:** every inserted/updated chunk should have a matching `EMBEDDING` generated with the **same model, dimension, and normalization** (`all-MiniLM-L6-v2`, 384, normalized). If `EMBEDDING` is `NULL`, semantic search will miss that row (lexical `LIKE` search on `CHUNK_TEXT` still works).
 - **Security:** `DB2_ALLOW_WRITE` enables powerful SQL via MCP—restrict/disable when not needed and protect credentials/config.
 
 ---
@@ -199,4 +201,65 @@ ORDER BY PAGE_NUM, CHUNK_INDEX;
 - `/tmp/opencode/db2_info_center_chunks.jsonl`, `/tmp/opencode/db2_sys_mon_guide_1213.txt`
 - `/tmp/opencode/db2_manuals/` (downloaded manuals)
 - `/tmp/opencode/load_db2_info_center.py`, `/tmp/opencode/load_all_db2_manuals.py`
-- Db2 tables: `DB2INST1.DOCUMENT_CHUNKS_PDF`, `DB2INST1.DB2_INFO_CENTER`
+- `/tmp/opencode/add_vectors_db2_info_center.py`, `/tmp/opencode/add_vectors_doc_chunks.py` (embedding generation/backfill scripts)
+- Db2 tables: `DB2INST1.DOCUMENT_CHUNKS_PDF`, `DB2INST1.DB2_INFO_CENTER` (with `EMBEDDING VECTOR(384,FLOAT32)`)
+
+---
+
+## 8. Vector / embedding update (Nov 2026)
+
+### 8.1 What changed
+- **Environment:** Db2 `v12.1.5.0` (VECTOR datatype available).
+- **Tables updated:** `DB2INST1.DB2_INFO_CENTER` and `DB2INST1.DOCUMENT_CHUNKS_PDF`.
+- **Column added:**
+  ```sql
+  ALTER TABLE DB2INST1.DB2_INFO_CENTER ADD COLUMN EMBEDDING VECTOR(384, FLOAT32);
+  ALTER TABLE DB2INST1.DOCUMENT_CHUNKS_PDF ADD COLUMN EMBEDDING VECTOR(384, FLOAT32);
+  ```
+- **Embedding model:** `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions), `normalize_embeddings=True`.
+- **Storage form (as applied):**
+  ```sql
+  UPDATE DB2INST1.<TABLE>
+  SET EMBEDDING = VECTOR('<[v1,...,v384]>', 384, FLOAT32)
+  WHERE CHUNK_ID = ?;
+  ```
+- **Population status (at update time):** `DOCUMENT_CHUNKS_PDF` fully embedded (**27/27**). `DB2_INFO_CENTER` backfill **in progress** (large table, ~39k rows) via `/tmp/opencode/add_vectors_db2_info_center.py` (log: `/tmp/opencode/add_vectors.log`, selects rows where `EMBEDDING IS NULL`, so rerunnable/resumable). Re-check with:
+  ```sql
+  SELECT COUNT(*) AS embedded,
+         (SELECT COUNT(*) FROM DB2INST1.DB2_INFO_CENTER) AS total
+  FROM DB2INST1.DB2_INFO_CENTER WHERE EMBEDDING IS NOT NULL;
+  ```
+- **Vector index:** not created. Attempts to create an index on the `VECTOR` column failed in this environment (e.g. `SQL0350N` / `SQLSTATE 42962`, data type not supported in that context), consistent with ingested Db2 SQL reference restrictions that a `VECTOR` column cannot be part of an index. Use function-based similarity (scan) unless/until a supported vector index mechanism/syntax is available for your exact Db2 level/configuration.
+
+### 8.2 How to act with the updated implementation (short guide)
+
+**A. Semantic (vector) retrieval**
+1. **Embed the user query** with the *same* model/settings: `all-MiniLM-L6-v2`, 384-dim, normalized.
+2. **Search by vector distance** in Db2 (example using cosine distance; pass the query vector string):
+   ```sql
+   SELECT CHUNK_ID, DOC_ID, PAGE_NUM,
+          SUBSTR(CAST(CHUNK_TEXT AS VARCHAR(2000)),1,2000) AS TEXT_SNIPPET,
+          VECTOR_DISTANCE(EMBEDDING, VECTOR('[q1,...,q384]', 384, FLOAT32), COSINE) AS dist
+   FROM DB2INST1.DB2_INFO_CENTER
+   WHERE EMBEDDING IS NOT NULL
+   ORDER BY dist
+   FETCH FIRST 5 ROWS ONLY;
+   ```
+3. **Hybrid option:** prefilter/narrow with lexical predicates (e.g. `DOC_ID`, `LIKE` on `CHUNK_TEXT`) then rank by `VECTOR_DISTANCE` for better relevance/performance on large sets.
+4. **Answering:** provide retrieved chunks to the LLM and cite `DOC_ID`, `CHUNK_ID`, `PAGE_NUM` (and state when information is not in retrieved results).
+
+**B. Inserting new chunks (keep vectors in sync)**
+1. Extract/chunk text and `INSERT` rows (including `CHUNK_TEXT`/metadata) as before.
+2. Generate an embedding for each `CHUNK_TEXT` with the same model/dim/normalization and `UPDATE ... SET EMBEDDING = VECTOR('[...]', 384, FLOAT32)` (or compute before insert and include it if your load path supports it).
+3. Verify: rows should not remain with `EMBEDDING IS NULL` if they must be discoverable via semantic search.
+
+**C. Backfill / maintenance**
+- Resume or backfill missing embeddings:
+  ```bash
+  /home/jkoops/pyenv/bin/python /tmp/opencode/add_vectors_db2_info_center.py --batch 64
+  ```
+  (script targets `DB2_INFO_CENTER` and processes `EMBEDDING IS NULL`; adapt for other tables as needed.)
+- After large loads, re-check counts of `EMBEDDING IS NULL` per table.
+
+**D. Changing model/dimension (if ever needed)**
+- Choose new model+dim, `ALTER`/recreate `EMBEDDING` as `VECTOR(<new_dim>, FLOAT32)` as appropriate, regenerate embeddings for **all** rows with the new model, and ensure query-time embeddings use the same model/dim/normalization. (Not performed; current setup remains 384-dim MiniLM.)
