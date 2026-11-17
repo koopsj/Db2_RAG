@@ -268,6 +268,8 @@ ORDER BY PAGE_NUM, CHUNK_INDEX;
 
 Two retrieval modes are available: **semantic (vector)** and **lexical (text/keyword)**. They can be combined (hybrid). Use `db2-server` `query_db2` for SQL, or a Python Db2 client for vector queries that need a generated query embedding.
 
+> **Validation (Nov 2026):** concrete lexical example queries below (including SSL and WLM), discovery/count queries, and semantic `VECTOR_DISTANCE` queries were re-run successfully against the current Db2 data. `DB2_INFO_CENTER` embeddings are complete (**39,211/39,211**). Template placeholders like `<TERM>`, `<QVEC>` must be replaced with real values before execution.
+
 #### A. Lexical search via `db2-server` (immediate, no embedding step)
 Works on `CHUNK_TEXT` regardless of `EMBEDDING` backfill status.
 
@@ -365,4 +367,89 @@ Run with the Python env that has `sentence-transformers` and `ibm_db` (e.g. `/ho
 #### C. Recommended practice (answering from RAG)
 - Retrieve top chunks (semantic and/or lexical), read/cite `DOC_ID, CHUNK_ID, PAGE_NUM`.
 - Synthesize the answer from retrieved text; if live instance state/config is required, verify against the actual Db2 instance/catalog (docs alone cannot confirm runtime state).
-- If semantic results look sparse, check `EMBEDDING IS NOT NULL` coverage (backfill may still be running) and fall back to lexical `LIKE` searches.
+- If semantic results look sparse, check `EMBEDDING IS NOT NULL` coverage and fall back to lexical `LIKE` searches.
+
+### 8.4 Worked example (vector perspective): configure JWT authentication
+
+This example shows the **exact end-to-end steps**: generate a query embedding → retrieve relevant chunks via `VECTOR_DISTANCE` → use retrieved chunks to answer.
+
+#### Step 1 — Define the question and generate its embedding (same model/settings)
+```python
+from sentence_transformers import SentenceTransformer
+
+question = "How to configure JWT authentication in Db2? TOKEN type JWT, JWKS, issuer, client authentication"
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")  # 384-dim
+qvec = model.encode([question], normalize_embeddings=True)[0]
+qvec_str = "[" + ",".join(f"{float(x):.8f}" for x in qvec) + "]"
+```
+
+#### Step 2 — Semantic retrieval from Db2
+```sql
+SELECT CHUNK_ID, DOC_ID, PAGE_NUM,
+       SUBSTR(CAST(CHUNK_TEXT AS VARCHAR(3500)),1,3500) AS TEXT_SNIPPET,
+       VECTOR_DISTANCE(EMBEDDING, VECTOR('<qvec_str>', 384, FLOAT32), COSINE) AS dist
+FROM DB2INST1.DB2_INFO_CENTER
+WHERE EMBEDDING IS NOT NULL
+ORDER BY dist
+FETCH FIRST 8 ROWS ONLY;
+```
+Run via Python/`ibm_db_dbi` (or any Db2 client) with `<qvec_str>` inserted (same pattern as 8.3).
+
+**Top retrieved chunks (example run, cosine distance):**
+| Rank | Chunk | Doc | Page | Dist |
+|---|---|---|---|---:|
+| 1 | `db2_sec_guide_1213_40_0` | `db2_sec_guide_1213` | 40 | 0.1965 |
+| 2 | `db2_sec_guide_1213_38_0` | `db2_sec_guide_1213` | 38 | 0.2332 |
+| 3 | `db2_sec_guide_1213_38_1` | `db2_sec_guide_1213` | 38 | 0.2404 |
+| 4 | `db2_sec_guide_1213_35_0` | `db2_sec_guide_1213` | 35 | 0.2926 |
+| 5 | `db2_sec_guide_1213_40_1` | `db2_sec_guide_1213` | 40 | 0.2990 |
+| 6 | `db2_sec_guide_1213_35_1` | `db2_sec_guide_1213` | 35 | 0.2997 |
+| 7 | `db2_sec_guide_1213_36_1` | `db2_sec_guide_1213` | 36 | 0.3082 |
+| 8 | `db2_sec_guide_1213_37_1` | `db2_sec_guide_1213` | 37 | 0.3095 |
+
+#### Step 3 — Configure JWT authentication (synthesized from retrieved chunks)
+*Source: IBM Db2 12.1.3 Database Security Guide (`db2_sec_guide_1213`, p.35–40). Validate against your exact Db2 level/environment.*
+
+**A. Server-side: token/JWT validation (`db2token.cfg`)**
+1. **Prerequisite:** TOKEN support enabled at the Db2 server; supported token type is JWT (p.40).
+2. **Create/configure `db2token.cfg`** with keystore and issuer/claim/key settings (p.35–36,38):
+   - `VERSION=1` (mandatory)
+   - `TOKEN_TYPES_SUPPORTED=JWT` (mandatory)
+   - `JWT_KEYDB=/path/to/jwtkeys.p12` (mandatory; local PKCS#12 keystore + `.sth` stash holding keys/certs; labels unique across IDPs)
+   - **Per-IDP group** (begins at `JWT_IDP_ISSUER`; applies until next issuer):
+     - `JWT_IDP_ISSUER=<iss>` (mandatory; must exactly match token `iss`)
+     - `JWT_IDP_AUTHID_CLAIM=<claim>` (mandatory; claim holding Db2 auth ID, e.g. `username`, `sub`, `userid`, `uid`; value uppercased)
+     - Key/cert label(s) for signature validation (e.g. `JWT_IDP_RSA_CERTIFICATE_LABEL=<label>`); algorithms supported include HS256/384/512, RS256/384/512, ES256/384/512 and (from 11.5.5) PS256/384/512 (p.38). Secret key for HS*, certificate/public key for RSA/ECDSA/PSS.
+     - `JWT_IDP_AUDIENCE=<aud>` (optional; if set, token `aud` must contain a configured value)
+3. **Example `db2token.cfg` (p.35):**
+   ```ini
+   VERSION=1
+   TOKEN_TYPES_SUPPORTED=JWT
+   JWT_KEYDB=/home/db2inst1/jwtkeys.p12
+   JWT_IDP_ISSUER=KNOXSSO
+   JWT_IDP_AUTHID_CLAIM=username
+   JWT_IDP_RSA_CERTIFICATE_LABEL=mylabel
+   # optional: JWT_IDP_AUDIENCE=db2,https://example.com
+   ```
+4. **Operational notes:** Db2 validates signature using configured keys and issuer match (p.38); Db2 does not support encrypted JWT; use TLS/SSL to protect tokens in transit (p.38). Token config refresh can be controlled (e.g. `DB2_REFRESH_TOKEN_CONFIG_ON_FAILURE`, dynamic) and manually refreshed via `CALL sysproc.admin_refresh_config('token')` (p.37). Limits/behavior (e.g. IDP/label counts, case-sensitivity) per p.36.
+
+**B. Client-side: connect with access token (p.40)**
+Tokens (generated outside Db2) carry identity+proof; connect with `ACCESSTOKENTYPE JWT`:
+- **CLP / embedded SQL:**
+  ```bash
+  db2 connect to sample accesstoken <access_token> accesstokentype jwt
+  ```
+- **CLI/ODBC** (connection string; not `db2cli.ini`/`db2dsdriver.cfg`):
+  ```text
+  accesstoken=<access_token>;accesstokentype=jwt;
+  ```
+- **JDBC** (`securityMechanism=19` / `TOKEN_SECURITY`):
+  ```java
+  dataSource.setSecurityMechanism(com.ibm.db2.jcc.DB2BaseDataSource.TOKEN_SECURITY);
+  dataSource.setAccessToken("access-token");
+  dataSource.setAccessTokenType("JWT");
+  // or URL: securityMechanism=19;accessToken=<token>;accessTokenType=JWT;sslConnection=true
+  ```
+
+**C. Retrieval/answering notes**
+- Cite `DOC_ID, CHUNK_ID, PAGE_NUM` from retrieved chunks. If top semantic results don’t cover a specific detail (e.g. external IdP/JWKS retrieval specifics), run follow-up semantic/lexical queries and verify against the actual Db2 12.1.5 instance and security policy.
